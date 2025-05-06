@@ -1,4 +1,4 @@
-# Analytics Platform - Airflow Setup
+# Data Pipeline Platform - Airflow Setup
 
 This repository contains the configuration for running Apache Airflow with external PostgreSQL and Redis services.
 
