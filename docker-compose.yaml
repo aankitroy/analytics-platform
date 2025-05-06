@@ -1,0 +1,166 @@
+# docker-compose.yaml - Connects to External PG/Redis
+
+# Networks are not strictly necessary for connecting to external hosts
+# via the default bridge network, but can be useful if you add other
+# local containers later. Let's remove it for simplicity.
+# networks:
+#   airflow-network:
+#     driver: bridge
+
+volumes:
+  airflow-dags:
+  airflow-logs:
+  airflow-config:
+  airflow-data:
+
+services:
+  # Airflow Database Initialization Service
+  # This service runs commands to initialize the Airflow DB and create a user
+  airflow-init:
+    image: ${AIRFLOW_IMAGE}
+    container_name: airflow_init
+    # Use root initially if needed, but the official entrypoint handles user switching
+    user: "0:0" # Using root initially for permissions with entrypoint
+    # The Airflow entrypoint handles waiting for the DB connection before running the command
+    command: >
+      bash -c "
+      # Commands to run after entrypoint waits for DB
+      airflow db migrate && \
+      airflow users create \
+          --username admin \
+          --firstname Aankit \
+          --lastname Roy \
+          --role Admin \
+          --email aankitroy1998@gmail.com \
+          --password admin # <-- Change this password immediately in the UI!
+      "
+    environment:
+      # --- Airflow Environment Variables ---
+      AIRFLOW_HOME: ${AIRFLOW_HOME}
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor # Use Celery Executor
+      # --- External Database Connection ---
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      # --- External Redis Connection (Broker) ---
+      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+      # --- Result Backend (using External DB or Redis) ---
+      # Option 1: Use the External Database for results (Recommended)
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      # Option 2: Use the External Redis for results (uncomment below and comment above if preferred)
+      # AIRFLOW__CELERY__RESULT_BACKEND: redis://:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_RESULT}
+      # -----------------------------------
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False' # Set to 'True' to load example DAGs
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
+      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY} # Use generated key from .env
+    volumes:
+      # Mount host directories for DAGs and Logs
+      - ./dags:${AIRFLOW_HOME}/dags
+      - ./logs:${AIRFLOW_HOME}/logs
+      # Use named volumes for config and potential data
+      - airflow-config:${AIRFLOW_HOME}/airflow.cfg # Consider mapping from host if you have custom config
+      - airflow-data:${AIRFLOW_HOME}/data
+    # No depends_on for external services. Reliance is on Airflow entrypoint wait.
+    restart: "no" # This is a one-off initialization service
+
+  # Airflow Webserver Service
+  airflow-webserver:
+    image: ${AIRFLOW_IMAGE}
+    container_name: airflow_webserver
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}" # Run as your user for volume permissions
+    ports:
+      - "8080:8080" # Map host port 8080 to container port 8080
+    command: airflow webserver
+    environment:
+      # --- Airflow Environment Variables (Same as init) ---
+      AIRFLOW_HOME: ${AIRFLOW_HOME}
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
+      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      # -----------------------------------
+    volumes:
+      - ./dags:${AIRFLOW_HOME}/dags
+      - ./logs:${AIRFLOW_HOME}/logs
+      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
+      - airflow-data:${AIRFLOW_HOME}/data
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully # Wait for init to finish
+    restart: unless-stopped
+
+  # Airflow Scheduler Service
+  airflow-scheduler:
+    image: ${AIRFLOW_IMAGE}
+    container_name: airflow_scheduler
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+    command: airflow scheduler
+    environment:
+      # --- Airflow Environment Variables (Same as init) ---
+      AIRFLOW_HOME: ${AIRFLOW_HOME}
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
+      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      # -----------------------------------
+    volumes:
+      - ./dags:${AIRFLOW_HOME}/dags
+      - ./logs:${AIRFLOW_HOME}/logs
+      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
+      - airflow-data:${AIRFLOW_HOME}/data
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Airflow Worker Service (Celery Worker)
+  airflow-worker:
+    image: ${AIRFLOW_IMAGE}
+    container_name: airflow_worker
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+    command: airflow celery worker
+    environment:
+      # --- Airflow Environment Variables (Same as init) ---
+      AIRFLOW_HOME: ${AIRFLOW_HOME}
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
+      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      # -----------------------------------
+    volumes:
+      - ./dags:${AIRFLOW_HOME}/dags
+      - ./logs:${AIRFLOW_HOME}/logs
+      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
+      - airflow-data:${AIRFLOW_HOME}/data
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Optional: Celery Flower for monitoring workers
+  # airflow-flower:
+  #   image: ${AIRFLOW_IMAGE}
+  #   container_name: airflow_flower
+  #   user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+  #   command: airflow celery flower --address=0.0.0.0 --port=5555 # Bind to all interfaces
+  #   environment:
+  #     AIRFLOW_HOME: ${AIRFLOW_HOME}
+  #     AIRFLOW__CELERY__BROKER_URL: redis://:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+  #     # Flower typically only needs the broker URL, but providing result backend is fine
+  #     # AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+  #   ports:
+  #     - "5555:5555" # Default Flower port
+  #   depends_on:
+  #     - airflow-worker # Flower should start after workers/broker are up
+  #   restart: unless-stopped
