@@ -13,140 +13,125 @@ volumes:
   airflow-config:
   airflow-data:
 
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE}
+  environment:
+    # --- Airflow Environment Variables ---
+    AIRFLOW_HOME: ${AIRFLOW_HOME}
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
+    AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+  volumes:
+    - ./dags:${AIRFLOW_HOME}/dags
+    - ./logs:${AIRFLOW_HOME}/logs
+    - ./config/airflow.cfg:${AIRFLOW_HOME}/airflow.cfg:ro
+    - airflow-data:${AIRFLOW_HOME}/data
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 30s
+
 services:
   # Airflow Database Initialization Service
   # This service runs commands to initialize the Airflow DB and create a user
   airflow-init:
-    image: ${AIRFLOW_IMAGE}
+    <<: *airflow-common
     container_name: airflow_init
-    # Use root initially if needed, but the official entrypoint handles user switching
-    user: "0:0" # Using root initially for permissions with entrypoint
-    # The Airflow entrypoint handles waiting for the DB connection before running the command
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
     command: >
-      bash -c "
-      # Commands to run after entrypoint waits for DB
-      airflow db migrate && \
-      airflow users create \
-          --username admin \
-          --firstname Aankit \
-          --lastname Roy \
-          --role Admin \
-          --email aankitroy1998@gmail.com \
-          --password admin # <-- Change this password immediately in the UI!
-      "
+      bash -c '
+      echo "Waiting for database to be ready..." &&
+      while ! airflow db check; do
+        echo "Database not ready yet. Waiting..."
+        sleep 5
+      done &&
+      echo "Database is ready!" &&
+      airflow db migrate &&
+      airflow db init &&
+      airflow users create -u admin -f Aankit -l Roy -r Admin -e aankitroy1998@gmail.com -p admin
+      '
     environment:
-      # --- Airflow Environment Variables ---
-      AIRFLOW_HOME: ${AIRFLOW_HOME}
-      AIRFLOW__CORE__EXECUTOR: CeleryExecutor # Use Celery Executor
-      # --- External Database Connection ---
+      AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      # --- External Redis Connection (Broker) ---
-      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
-      # --- Result Backend (using External DB or Redis) ---
-      # Option 1: Use the External Database for results (Recommended)
-      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      # Option 2: Use the External Redis for results (uncomment below and comment above if preferred)
-      # AIRFLOW__CELERY__RESULT_BACKEND: redis://:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_RESULT}
-      # -----------------------------------
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'False' # Set to 'True' to load example DAGs
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
-      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY} # Use generated key from .env
-    volumes:
-      # Mount host directories for DAGs and Logs
-      - ./dags:${AIRFLOW_HOME}/dags
-      - ./logs:${AIRFLOW_HOME}/logs
-      # Use named volumes for config and potential data
-      - airflow-config:${AIRFLOW_HOME}/airflow.cfg # Consider mapping from host if you have custom config
-      - airflow-data:${AIRFLOW_HOME}/data
-    # No depends_on for external services. Reliance is on Airflow entrypoint wait.
-    restart: "no" # This is a one-off initialization service
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_PASSWORD: 'admin'
+      _AIRFLOW_WWW_USER_EMAIL: 'aankitroy1998@gmail.com'
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "airflow db check || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # Airflow Webserver Service
   airflow-webserver:
-    image: ${AIRFLOW_IMAGE}
+    <<: *airflow-common
     container_name: airflow_webserver
-    user: "${AIRFLOW_UID}:${AIRFLOW_GID}" # Run as your user for volume permissions
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
     ports:
-      - "8080:8080" # Map host port 8080 to container port 8080
-    command: airflow webserver
+      - "8080:8080"
+    command: >
+      bash -c '
+      airflow db init &&
+      airflow db check &&
+      airflow webserver
+      '
     environment:
-      # --- Airflow Environment Variables (Same as init) ---
-      AIRFLOW_HOME: ${AIRFLOW_HOME}
-      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
-      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
-      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
-      # -----------------------------------
-    volumes:
-      - ./dags:${AIRFLOW_HOME}/dags
-      - ./logs:${AIRFLOW_HOME}/logs
-      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
-      - airflow-data:${AIRFLOW_HOME}/data
+      AIRFLOW__WEBSERVER__WORKERS: "2"
+      AIRFLOW__WEBSERVER__WORKER_CLASS: "sync"
     depends_on:
       airflow-init:
-        condition: service_completed_successfully # Wait for init to finish
+        condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # Airflow Scheduler Service
   airflow-scheduler:
-    image: ${AIRFLOW_IMAGE}
+    <<: *airflow-common
     container_name: airflow_scheduler
     user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
     command: airflow scheduler
-    environment:
-      # --- Airflow Environment Variables (Same as init) ---
-      AIRFLOW_HOME: ${AIRFLOW_HOME}
-      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
-      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
-      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
-      # -----------------------------------
-    volumes:
-      - ./dags:${AIRFLOW_HOME}/dags
-      - ./logs:${AIRFLOW_HOME}/logs
-      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
-      - airflow-data:${AIRFLOW_HOME}/data
     depends_on:
       airflow-init:
         condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $${HOSTNAME} || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # Airflow Worker Service (Celery Worker)
   airflow-worker:
-    image: ${AIRFLOW_IMAGE}
+    <<: *airflow-common
     container_name: airflow_worker
     user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
     command: airflow celery worker
-    environment:
-      # --- Airflow Environment Variables (Same as init) ---
-      AIRFLOW_HOME: ${AIRFLOW_HOME}
-      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CELERY__BROKER_URL: redis://${EXTERNAL_REDIS_USER}:${REDIS_PASSWORD}@${EXTERNAL_REDIS_HOST}:${EXTERNAL_REDIS_PORT}/${REDIS_DB_BROKER}
-      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${EXTERNAL_POSTGRES_HOST}:${EXTERNAL_POSTGRES_PORT}/${POSTGRES_DB}
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'True'
-      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
-      # -----------------------------------
-    volumes:
-      - ./dags:${AIRFLOW_HOME}/dags
-      - ./logs:${AIRFLOW_HOME}/logs
-      - airflow-config:${AIRFLOW_HOME}/airflow.cfg
-      - airflow-data:${AIRFLOW_HOME}/data
     depends_on:
       airflow-init:
         condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "airflow celery worker --check || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # Optional: Celery Flower for monitoring workers
   # airflow-flower:
