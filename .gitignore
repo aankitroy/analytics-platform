@@ -1,3 +1,14 @@
-.env
-logs/*
-.DS_Store
+# .gitignore
+.env*
+__pycache__/
+*.pyc
+venv/
+env/
+node_modules/
+dist/
+build/
+*.log
+*.sqlite
+data/ # Directories for persistent data volumes (Docker)
+# Docker specific
+!*/.gitkeep # Keep .gitkeep files even if directory is otherwise empty
