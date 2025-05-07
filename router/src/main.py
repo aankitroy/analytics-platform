@@ -60,26 +60,41 @@ pg_conn_pool = None # Use connection pooling for PG
 ch_client = None # Use a ClickHouse client/pool
 
 def connect_to_services():
-    """Initializes connections to Kafka, Redis, PG, ClickHouse."""
-    global kafka_consumer, kafka_producer, redis_client #, pg_conn_pool, ch_client
+    """
+    Initializes connections/pools to Kafka, Redis, PG, ClickHouse.
+    Includes a startup delay to wait for dependencies.
+    """
+    # --- ADD STARTUP DELAY ---
+    logger.info("Applying startup delay...")
+    time.sleep(15) # Wait for 15 seconds (adjust as needed)
+    logger.info("Startup delay finished. Attempting connections.")
+    # --- END STARTUP DELAY ---
+    global kafka_consumer, kafka_producer, redis_client, pg_conn_pool, ch_client
 
+    # Kafka Connection
     logger.info(f"Connecting to Kafka brokers: {KAFKA_BROKERS}")
     try:
         kafka_consumer = KafkaConsumer(
             KAFKA_TOPIC_RAW,
             bootstrap_servers=KAFKA_BROKERS,
             group_id=KAFKA_CONSUMER_GROUP_ID,
-            auto_offset_reset='earliest', # Start consuming from the beginning if no offset found
-            enable_auto_commit=False # We'll commit manually after successful processing
+            auto_offset_reset='earliest',
+            enable_auto_commit=False
+            # Add security config (SASL/SSL) here for production
         )
         kafka_producer = KafkaProducer(
-             bootstrap_servers=KAFKA_BROKERS,
-             value_serializer=lambda x: json.dumps(x).encode('utf-8') # Serialize outgoing messages to JSON bytes
+            bootstrap_servers=KAFKA_BROKERS,
+            value_serializer=lambda x: json.dumps(x).encode('utf-8')
+            # Add security config (SASL/SSL) here for production
         )
+        # Test connection by getting cluster metadata (can take a moment)
+        # This call might fail if Kafka is truly not ready, even after the sleep
+        # Consider adding retry logic here for robustness
+        kafka_consumer.topics()
         logger.info("Connected to Kafka.")
     except Exception as e:
-        logger.error(f"Failed to connect to Kafka: {e}")
-        # In a real app, you'd handle this (e.g., exit, retry)
+        logger.critical(f"Failed to connect to Kafka: {e}", exc_info=True)
+        # Kafka is essential, re-raise exception to prevent startup
         raise
 
     logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}")
