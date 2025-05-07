@@ -1,0 +1,123 @@
+# Define a custom network for our services to communicate with each other
+networks:
+  analytics_net:
+
+services:
+
+  # 1. Zookeeper: Essential dependency for Kafka.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - analytics_net
+
+  # 2. Kafka: The message broker.
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092" # Expose to host for producers
+      - "9093:9093" # Internal communication
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_TOPIC_SHARED_RAW_EVENTS_PARTITIONS: 6
+      KAFKA_TOPIC_SHARED_RAW_EVENTS_REPLICAS: 1
+      KAFKA_TOPIC_SHARED_RAW_EVENTS_RETENTION_MS: 604800000 # 7 days
+      KAFKA_TOPIC_SHARED_DEAD_LETTER_PARTITIONS: 3
+      KAFKA_TOPIC_SHARED_DEAD_LETTER_REPLICAS: 1
+      KAFKA_TOPIC_SHARED_DEAD_LETTER_RETENTION_MS: 1209600000 # 14 days
+    volumes:
+      - kafka_data:/var/lib/kafka
+    depends_on:
+      - zookeeper
+    networks:
+      - analytics_net
+
+  # 3. Redis: Client metadata cache.
+  redis:
+    image: redis:latest
+    hostname: redis
+    container_name: redis
+    ports:
+      - "6379:6379" # Expose Redis port
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    networks:
+      - analytics_net
+
+  # 4. Analytics Router: Your custom ingestion service.
+  analytics-router:
+    build:
+      context: ../../router
+      dockerfile: Dockerfile
+    hostname: analytics-router
+    container_name: analytics-router
+    ports:
+      - "8080:8080" # Expose a port (e.g., for health checks, metrics)
+    environment:
+      # Pass configuration to the router via environment variables.
+      KAFKA_BROKERS: kafka:9093 # Internal Kafka listener (within Docker network)
+      KAFKA_TOPIC_RAW: shared_raw_events
+      KAFKA_TOPIC_DLQ: shared_dead_letter
+      KAFKA_CONSUMER_GROUP_ID: analytics_router_group
+      REDIS_HOST: redis # Internal Redis listener (within Docker network)
+      REDIS_PORT: 6379
+      CLIENT_CACHE_TTL_SECONDS: 600 # 10 minutes
+      ROUTER_LISTEN_PORT: 8080
+
+      # --- Connection details for EXTERNAL PostgreSQL and ClickHouse ---
+      POSTGRES_METADATA_HOST: ${POSTGRES_METADATA_HOST}
+      POSTGRES_METADATA_PORT: ${POSTGRES_METADATA_PORT}
+      POSTGRES_METADATA_DB: ${POSTGRES_METADATA_DB}
+      POSTGRES_METADATA_USER: ${POSTGRES_METADATA_USER}
+      POSTGRES_METADATA_PASSWORD: ${POSTGRES_METADATA_PASSWORD}
+
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT_NATIVE: ${CLICKHOUSE_PORT_NATIVE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+    volumes:
+      - ../../router/src:/app/src # Mount the router source code
+
+    # --- CORRECTED DEPENDS_ON ---
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - analytics_net
+
+# Define named volumes to persist data across container lifecycles
+volumes:
+  zookeeper_data: {}
+  kafka_data: {}
+  redis_data: {}

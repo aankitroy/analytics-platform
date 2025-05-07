@@ -1,0 +1,6 @@
+# your-analytics-monorepo/router/requirements.txt
+kafka-python>=2.0.0
+redis>=4.0.0
+psycopg2-binary>=2.9.0 # Or pg8000
+clickhouse-driver>=0.2.0
+# Add any other dependencies your router code uses
