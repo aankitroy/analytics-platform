@@ -66,7 +66,7 @@ def connect_to_services():
     """
     # --- ADD STARTUP DELAY ---
     logger.info("Applying startup delay...")
-    time.sleep(15) # Wait for 15 seconds (adjust as needed)
+    time.sleep(20) # Wait for 15 seconds (adjust as needed)
     logger.info("Startup delay finished. Attempting connections.")
     # --- END STARTUP DELAY ---
     global kafka_consumer, kafka_producer, redis_client, pg_conn_pool, ch_client
