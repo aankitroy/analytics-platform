@@ -14,8 +14,16 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
     volumes:
       - zookeeper_data:/var/lib/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 10s
     networks:
       - analytics_net
 
@@ -41,10 +49,30 @@ services:
       KAFKA_TOPIC_SHARED_DEAD_LETTER_PARTITIONS: 3
       KAFKA_TOPIC_SHARED_DEAD_LETTER_REPLICAS: 1
       KAFKA_TOPIC_SHARED_DEAD_LETTER_RETENTION_MS: 1209600000 # 14 days
+      # Add startup optimization settings
+      KAFKA_CFG_NUM_NETWORK_THREADS: 3
+      KAFKA_CFG_NUM_IO_THREADS: 8
+      KAFKA_CFG_BACKGROUND_THREADS: 10
+      KAFKA_CFG_QUEUED_MAX_REQUESTS: 500
+      KAFKA_CFG_QUEUED_MAX_BYTES: 104857600
+      KAFKA_CFG_REQUEST_TIMEOUT_MS: 30000
+      KAFKA_CFG_REPLICA_LAG_TIME_MAX_MS: 10000
+      KAFKA_CFG_REPLICA_FETCH_WAIT_MAX_MS: 500
+      KAFKA_CFG_REPLICA_FETCH_MAX_BYTES: 1048576
+      KAFKA_CFG_REPLICA_FETCH_MIN_BYTES: 1
+      KAFKA_CFG_NUM_REPLICA_FETCHERS: 2
+      KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
     volumes:
       - kafka_data:/var/lib/kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9093 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - analytics_net
 
@@ -73,7 +101,7 @@ services:
     hostname: analytics-router
     container_name: analytics-router
     ports:
-      - "8080:8080" # Expose a port (e.g., for health checks, metrics)
+      - "8089:8080" # Expose a port (e.g., for health checks, metrics)
     environment:
       # Pass configuration to the router via environment variables.
       KAFKA_BROKERS: kafka:9093 # Internal Kafka listener (within Docker network)
@@ -108,7 +136,7 @@ services:
         condition: service_started
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD", "curl", "-f", "http://localhost:8089/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -116,8 +144,240 @@ services:
     networks:
       - analytics_net
 
-# Define named volumes to persist data across container lifecycles
+  # 5. Airflow: The workflow engine.
+  airflow-webserver:
+    # Use a standard Airflow image. Make sure the version is compatible (2.8+)
+    image: apache/airflow:2.8.1
+    container_name: airflow-webserver
+    restart: always # Automatically restart if it fails
+    command: >
+      bash -c "
+      pip install -r /requirements.txt &&
+      airflow webserver
+      "
+    ports:
+      - "8080:8080" # Expose the Airflow UI port to your host
+    environment:
+      # Configure Airflow database connection string to use your EXTERNAL PostgreSQL
+      # Make sure these variables are available to this container (e.g., via --env-file)
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${POSTGRES_METADATA_USER}:${POSTGRES_METADATA_PASSWORD}@${POSTGRES_METADATA_HOST}:${POSTGRES_METADATA_PORT}/${POSTGRES_METADATA_DB}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: ${AIRFLOW_CORE_DAGS_ARE_PAUSED_AT_CREATION} # Pause DAGs by default on startup
+      AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW_CORE_LOAD_EXAMPLES} # Don't load example DAGs
+      AIRFLOW__API__ENABLE_XCOM_PICKLING: ${AIRFLOW_API_ENABLE_XCOM_PICKLING} # Needed for some cross-task communication (be aware of security implications)
+      # Configure Celery
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: redis://redis:6379/0
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      # Add other Airflow configurations as needed
+
+      # Make external DB and other service connection details available for DAGs
+      # These are used by DAGs via Airflow Connections or direct environment access
+      POSTGRES_METADATA_HOST: ${POSTGRES_METADATA_HOST}
+      POSTGRES_METADATA_PORT: ${POSTGRES_METADATA_PORT}
+      POSTGRES_METADATA_DB: ${POSTGRES_METADATA_DB}
+      POSTGRES_METADATA_USER: ${POSTGRES_METADATA_USER}
+      POSTGRES_METADATA_PASSWORD: ${POSTGRES_METADATA_PASSWORD}
+
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT_NATIVE: ${CLICKHOUSE_PORT_NATIVE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+      REDIS_HOST: redis # Use the Docker service name for Redis
+      REDIS_PORT: 6379
+
+      KAFKA_BROKERS: ${KAFKA_BROKERS_HOST}:${KAFKA_BROKERS_PORT} # Use the Docker service name for Kafka (internal listener)
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+
+    volumes:
+      # Mount requirements file
+      - ../../airflow/requirements.txt:/requirements.txt
+      # Mount your DAGs into the webserver so it can find them
+      - ../../airflow/dags:/opt/airflow/dags
+      # Mount DLT sources if you have custom ones
+      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
+      # Mount logs volume so logs are persistent and accessible
+      - airflow_logs:/opt/airflow/logs
+      # Mount custom plugins if any
+      # - ./airflow/plugins:/opt/airflow/plugins
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      analytics-router:
+        condition: service_started
+
+    networks:
+      - analytics_net
+
+  # Airflow Scheduler: Triggers tasks based on DAG schedules
+  airflow-scheduler:
+    image: apache/airflow:2.8.1 # Matching image version
+    container_name: airflow-scheduler
+    restart: always
+    command: >
+      bash -c "
+      pip install -r /requirements.txt &&
+      airflow scheduler
+      "
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${POSTGRES_METADATA_USER}:${POSTGRES_METADATA_PASSWORD}@${POSTGRES_METADATA_HOST}:${POSTGRES_METADATA_PORT}/${POSTGRES_METADATA_DB}
+      # Configure Celery
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: redis://redis:6379/0
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      # Scheduler also needs external DB and other service connection details for DAGs
+      POSTGRES_METADATA_HOST: ${POSTGRES_METADATA_HOST}
+      POSTGRES_METADATA_PORT: ${POSTGRES_METADATA_PORT}
+      POSTGRES_METADATA_DB: ${POSTGRES_METADATA_DB}
+      POSTGRES_METADATA_USER: ${POSTGRES_METADATA_USER}
+      POSTGRES_METADATA_PASSWORD: ${POSTGRES_METADATA_PASSWORD}
+
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT_NATIVE: ${CLICKHOUSE_PORT_NATIVE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      KAFKA_BROKERS: ${KAFKA_BROKERS_HOST}:${KAFKA_BROKERS_PORT}
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+
+    volumes:
+      # Mount requirements file
+      - ../../airflow/requirements.txt:/requirements.txt
+      # Mount the same DAGs, DLT sources, and logs as the webserver
+      - ../../airflow/dags:/opt/airflow/dags
+      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
+      - airflow_logs:/opt/airflow/logs
+      # - ./airflow/plugins:/opt/airflow/plugins # Mount custom plugins
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_started
+      analytics-router:
+        condition: service_started
+
+    networks:
+      - analytics_net
+
+  # Airflow Worker(s): Execute tasks (using LocalExecutor for simplicity)
+  # You can scale this service up if needed
+  airflow-worker:
+    image: apache/airflow:2.8.1 # Matching image version
+    container_name: airflow-worker # If scaling, use a dynamic name or add a number
+    restart: always
+    command: >
+      bash -c "
+      pip install -r /requirements.txt &&
+      airflow celery worker
+      "
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${POSTGRES_METADATA_USER}:${POSTGRES_METADATA_PASSWORD}@${POSTGRES_METADATA_HOST}:${POSTGRES_METADATA_PORT}/${POSTGRES_METADATA_DB}
+      # Configure Celery
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: redis://redis:6379/0
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      # Worker also needs external DB and other service connection details for DAGs
+      POSTGRES_METADATA_HOST: ${POSTGRES_METADATA_HOST}
+      POSTGRES_METADATA_PORT: ${POSTGRES_METADATA_PORT}
+      POSTGRES_METADATA_DB: ${POSTGRES_METADATA_DB}
+      POSTGRES_METADATA_USER: ${POSTGRES_METADATA_USER}
+      POSTGRES_METADATA_PASSWORD: ${POSTGRES_METADATA_PASSWORD}
+
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT_NATIVE: ${CLICKHOUSE_PORT_NATIVE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      KAFKA_BROKERS: ${KAFKA_BROKERS_HOST}:${KAFKA_BROKERS_PORT}
+      KAFKA_TOPIC_RAW: ${KAFKA_TOPIC_RAW}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ}
+
+    volumes:
+      # Mount requirements file
+      - ../../airflow/requirements.txt:/requirements.txt
+      # Mount the same DAGs, DLT sources, and logs as the webserver/scheduler
+      - ../../airflow/dags:/opt/airflow/dags
+      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
+      - airflow_logs:/opt/airflow/logs
+      # - ./airflow/plugins:/opt/airflow/plugins # Mount custom plugins
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_started
+      analytics-router:
+        condition: service_started
+
+    networks:
+      - analytics_net
+
+  # Airflow Init Container (Helper to run migrations before webserver/scheduler start)
+  # This container runs once and exits.
+  airflow-init:
+    image: apache/airflow:2.8.1
+    container_name: airflow-init
+    # Command to run Airflow database migrations
+    command: >
+      bash -c "
+      pip install -r /requirements.txt &&
+      airflow db migrate &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true
+      "
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${POSTGRES_METADATA_USER}:${POSTGRES_METADATA_PASSWORD}@${POSTGRES_METADATA_HOST}:${POSTGRES_METADATA_PORT}/${POSTGRES_METADATA_DB}
+      # Needs external DB connection details
+      POSTGRES_METADATA_HOST: ${POSTGRES_METADATA_HOST}
+      POSTGRES_METADATA_PORT: ${POSTGRES_METADATA_PORT}
+      POSTGRES_METADATA_DB: ${POSTGRES_METADATA_DB}
+      POSTGRES_METADATA_USER: ${POSTGRES_METADATA_USER}
+      POSTGRES_METADATA_PASSWORD: ${POSTGRES_METADATA_PASSWORD}
+
+    volumes:
+      # Mount requirements file
+      - ../../airflow/requirements.txt:/requirements.txt
+      # Mount DAGs even though init doesn't need them, just for consistency or if your migrations depend on plugins
+      - ../../airflow/dags:/opt/airflow/dags
+      # - ./airflow/plugins:/opt/airflow/plugins # Mount custom plugins
+
+    depends_on:
+      # This container *must* wait for the external database to be reachable.
+      # Relying on the router's connection success is an indirect way to check,
+      # or you could implement a specific wait script here.
+      # Let's rely on the router being able to connect to the external DB.
+      analytics-router:
+        condition: service_started # Wait for router process to start
+
+    networks:
+      - analytics_net
+    # This container exits after running the command.
+    # The webserver and scheduler will implicitly wait for this container
+    # to complete if it's listed in their depends_on section with 'service_completed_successfully'.
+    # However, we'll handle the dependency explicitly in the up command below for simplicity.
+
+
 volumes:
   zookeeper_data: {}
   kafka_data: {}
   redis_data: {}
+  # Add a volume for Airflow logs
+  airflow_logs: {}
+
+# Define named volumes to persist data across container lifecycles

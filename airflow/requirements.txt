@@ -1,0 +1,19 @@
+apache-airflow>=2.8.1 # Match your Airflow image version
+
+# DLT (for batch ingestion)
+dlt[clickhouse]>=0.4.0 # Install dlt with the ClickHouse destination
+
+# Database Clients (for interacting with external DBs from DAGs)
+psycopg2-binary>=2.9.0   # Or pg8000 for PostgreSQL
+clickhouse-connect>=0.6.0 # For ClickHouse
+
+# Kafka Client (for DLQ reprocessing DAG)
+kafka-python>=2.0.0
+
+# Redis Client (if DAGs interact directly, though router handles caching)
+redis>=4.0.0
+
+# Airflow-specific dependencies
+apache-airflow-providers-postgres>=5.6.0,<6.0.0
+apache-airflow-providers-redis>=3.0.0
+apache-airflow-providers-apache-spark>=4.0.0
