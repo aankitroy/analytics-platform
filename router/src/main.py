@@ -3,17 +3,23 @@ import os
 import logging
 import json
 import time
-from kafka import KafkaConsumer, KafkaProducer # Assuming you'll use kafka-python
-# You'll need libraries for Redis, PostgreSQL, and ClickHouse based on your Go/Python choice
-# Example imports for Python:
-# import redis
-# import psycopg2 # Or a different PG adapter like pg8000
-# from clickhouse_driver import Client as ClickHouseClient
+import uuid
+import hashlib
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
-# Load environment variables from .env file if it exists
+# Import actual client libraries
+from kafka import KafkaConsumer, KafkaProducer
+import redis
+import psycopg2.pool
+# --- CHANGE: Import clickhouse_connect ---
+import clickhouse_connect
+# --- END CHANGE ---
 
 # --- Configuration Loading ---
-# Load configuration from environment variables
+# ... (Kafka, Redis, PG config - same as before) ...
+
 KAFKA_BROKERS = os.getenv('KAFKA_BROKERS', 'localhost:9092').split(',')
 KAFKA_TOPIC_RAW = os.getenv('KAFKA_TOPIC_RAW', 'shared_raw_events')
 KAFKA_TOPIC_DLQ = os.getenv('KAFKA_TOPIC_DLQ', 'shared_dead_letter')
@@ -23,52 +29,57 @@ REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
 CLIENT_CACHE_TTL_SECONDS = int(os.getenv('CLIENT_CACHE_TTL_SECONDS', '600'))
 
-CLICKHOUSE_HOST = os.getenv('CLICKHOUSE_HOST', 'localhost')
-CLICKHOUSE_PORT_NATIVE = int(os.getenv('CLICKHOUSE_PORT_NATIVE', '9000'))
-CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
-CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', '')
+# Configuration for EXTERNAL databases - require these environment variables
+CLICKHOUSE_HOST = os.environ.get('CLICKHOUSE_HOST')
+CLICKHOUSE_PORT_HTTP = int(os.environ.get('CLICKHOUSE_PORT_HTTP', '8123'))  # HTTP protocol port
+CLICKHOUSE_USER = os.environ.get('CLICKHOUSE_USER')
+CLICKHOUSE_PASSWORD = os.environ.get('CLICKHOUSE_PASSWORD')
 
-POSTGRES_METADATA_HOST = os.getenv('POSTGRES_METADATA_HOST', 'localhost')
-POSTGRES_METADATA_PORT = int(os.getenv('POSTGRES_METADATA_PORT', '5432'))
-POSTGRES_METADATA_DB = os.getenv('POSTGRES_METADATA_DB', 'analytics_metadata')
-POSTGRES_METADATA_USER = os.getenv('POSTGRES_METADATA_USER', 'aankitroy')
-POSTGRES_METADATA_PASSWORD = os.getenv('POSTGRES_METADATA_PASSWORD', '')
+POSTGRES_METADATA_HOST = os.environ.get('POSTGRES_METADATA_HOST')
+POSTGRES_METADATA_PORT = int(os.environ.get('POSTGRES_METADATA_PORT', '5432'))
+POSTGRES_METADATA_DB = os.environ.get('POSTGRES_METADATA_DB')
+POSTGRES_METADATA_USER = os.environ.get('POSTGRES_METADATA_USER')
+POSTGRES_METADATA_PASSWORD = os.environ.get('POSTGRES_METADATA_PASSWORD')
 
-# Router Configuration
 ROUTER_LISTEN_PORT = int(os.getenv('ROUTER_LISTEN_PORT', '8080'))
 
-# Validate required environment variables
 required_vars = {
+    'CLICKHOUSE_HOST': CLICKHOUSE_HOST,
+    'CLICKHOUSE_USER': CLICKHOUSE_USER,
     'CLICKHOUSE_PASSWORD': CLICKHOUSE_PASSWORD,
-    'POSTGRES_METADATA_PASSWORD': POSTGRES_METADATA_PASSWORD
+    'POSTGRES_METADATA_HOST': POSTGRES_METADATA_HOST,
+    'POSTGRES_METADATA_DB': POSTGRES_METADATA_DB,
+    'POSTGRES_METADATA_USER': POSTGRES_METADATA_USER,
+    'POSTGRES_METADATA_PASSWORD': POSTGRES_METADATA_PASSWORD,
+    'REDIS_HOST': REDIS_HOST,
 }
 
 missing_vars = [var for var, value in required_vars.items() if not value]
 if missing_vars:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logging.critical(f"Missing required environment variables: {', '.join(missing_vars)}")
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Service Connections (Placeholder) ---
-# In a real implementation, set up proper connection pooling and error handling
-kafka_consumer = None
-kafka_producer = None
-redis_client = None
-pg_conn_pool = None # Use connection pooling for PG
-ch_client = None # Use a ClickHouse client/pool
+# --- Service Clients ---
+# Initialize global variables for clients/pools
+kafka_consumer: KafkaConsumer | None = None
+kafka_producer: KafkaProducer | None = None
+redis_client: redis.StrictRedis | None = None
+pg_conn_pool: psycopg2.pool.SimpleConnectionPool | None = None
+# --- CHANGE: Fix clickhouse_connect client type ---
+ch_client: Any | None = None  # Using Any since clickhouse_connect doesn't expose its client type
+# --- END CHANGE ---
+
 
 def connect_to_services():
-    """
-    Initializes connections/pools to Kafka, Redis, PG, ClickHouse.
-    Includes a startup delay to wait for dependencies.
-    """
-    # --- ADD STARTUP DELAY ---
+    """Initializes connections/pools to Kafka, Redis, PG, ClickHouse."""
     logger.info("Applying startup delay...")
-    time.sleep(20) # Wait for 15 seconds (adjust as needed)
+    time.sleep(35)
     logger.info("Startup delay finished. Attempting connections.")
-    # --- END STARTUP DELAY ---
+
     global kafka_consumer, kafka_producer, redis_client, pg_conn_pool, ch_client
 
     # Kafka Connection
@@ -80,302 +91,277 @@ def connect_to_services():
             group_id=KAFKA_CONSUMER_GROUP_ID,
             auto_offset_reset='earliest',
             enable_auto_commit=False
-            # Add security config (SASL/SSL) here for production
         )
         kafka_producer = KafkaProducer(
             bootstrap_servers=KAFKA_BROKERS,
             value_serializer=lambda x: json.dumps(x).encode('utf-8')
-            # Add security config (SASL/SSL) here for production
         )
-        # Test connection by getting cluster metadata (can take a moment)
-        # This call might fail if Kafka is truly not ready, even after the sleep
-        # Consider adding retry logic here for robustness
-        kafka_consumer.topics()
+        kafka_consumer.topics() # Test connection
         logger.info("Connected to Kafka.")
     except Exception as e:
         logger.critical(f"Failed to connect to Kafka: {e}", exc_info=True)
-        # Kafka is essential, re-raise exception to prevent startup
         raise
 
+    # Redis Connection
     logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}")
     try:
-        # redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        # redis_client.ping() # Check connection
+        redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        redis_client.ping() # Test connection
         logger.info("Connected to Redis.")
-        # Placeholder connection (replace with actual Redis client)
-        class MockRedis:
-            def get(self, key): return None # Simulate cache miss
-            def setex(self, key, ttl, value): pass
-        redis_client = MockRedis()
-
     except Exception as e:
-        logger.error(f"Failed to connect to Redis: {e}")
-        # In a real app, decide if Redis is critical or if you can operate without cache
-
-    logger.info(f"Connecting to PostgreSQL at {POSTGRES_METADATA_HOST}:{POSTGRES_METADATA_PORT}")
-    try:
-        # Example using psycopg2 (requires installation)
-        # pg_conn_pool = psycopg2.pool.SimpleConnectionPool(
-        #     1, 10, # min conn, max conn
-        #     host=POSTGRES_METADATA_HOST,
-        #     port=POSTGRES_METADATA_PORT,
-        #     database=POSTGRES_METADATA_DB,
-        #     user=POSTGRES_METADATA_USER,
-        #     password=POSTGRES_METADATA_PASSWORD
-        # )
-        # with pg_conn_pool.getconn() as conn:
-        #    with conn.cursor() as cur:
-        #        cur.execute("SELECT 1")
-        logger.info("Connected to PostgreSQL.")
-         # Placeholder connection (replace with actual PG client/pool)
-        class MockPgConn:
-             def cursor(self): return MockPgCursor()
-             def close(self): pass
-             def commit(self): pass
-        class MockPgCursor:
-             def execute(self, query, params=None): pass
-             def fetchone(self):
-                 # Simulate finding the test client defined in 02_insert_test_client.sql
-                 test_client_id = 'a1b2c3d4-e5f6-7890-1234-567890abcdef'
-                 test_api_key_hash = 'c44b61ce039b4637f3a7cb92dcc445876a4720d25d1c9614fe08fc734f2da20f' # **MATCH THE HASH FROM SQL FILE**
-                 test_db_name = 'client_test'
-                 return (test_client_id, test_api_key_hash, test_db_name, 'active') # (client_id, api_key_hash, ch_database_name, status)
-             def close(self): pass
-        class MockPgPool:
-            def getconn(self): return MockPgConn()
-            def putconn(self, conn): pass
-        pg_conn_pool = MockPgPool()
-
-
-    except Exception as e:
-        logger.error(f"Failed to connect to PostgreSQL: {e}")
-        # PG is critical as it's the source of truth for clients
+        logger.critical(f"Failed to connect to Redis: {e}", exc_info=True)
         raise
 
-
-    logger.info(f"Connecting to ClickHouse at {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT_NATIVE}")
+    # PostgreSQL Connection Pool
+    logger.info(f"Connecting to PostgreSQL metadata DB at {POSTGRES_METADATA_HOST}:{POSTGRES_METADATA_PORT}")
     try:
-        # Example using clickhouse-driver (requires installation)
-        # ch_client = ClickHouseClient(
-        #     host=CLICKHOUSE_HOST,
-        #     port=CLICKHOUSE_PORT_NATIVE, # Use the native port
-        #     user=CLICKHOUSE_USER,
-        #     password=CLICKHOUSE_PASSWORD,
-        #     database=None # Connect without specifying a DB initially, will switch later
-        # )
-        # ch_client.execute("SELECT 1") # Check connection
+        pg_conn_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10,
+            host=POSTGRES_METADATA_HOST,
+            port=POSTGRES_METADATA_PORT,
+            database=POSTGRES_METADATA_DB,
+            user=POSTGRES_METADATA_USER,
+            password=POSTGRES_METADATA_PASSWORD
+        )
+        with pg_conn_pool.getconn() as conn:
+           with conn.cursor() as cur:
+               cur.execute("SELECT 1")
+        logger.info("Connected to PostgreSQL and pool initialized.")
+    except Exception as e:
+        logger.critical(f"Failed to connect to PostgreSQL: {e}", exc_info=True)
+        raise
+
+    # ClickHouse Connection (using clickhouse-connect)
+    logger.info(f"Connecting to ClickHouse at {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT_HTTP}")
+    try:
+        ch_client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT_HTTP,  # Use HTTP port
+            username=CLICKHOUSE_USER,
+            password=CLICKHOUSE_PASSWORD,
+            database='default'
+        )
+        ch_client.command('SELECT 1')  # Test connection
         logger.info("Connected to ClickHouse.")
-        # Placeholder connection (replace with actual CH client)
-        class MockClickHouseClient:
-             def execute(self, query, params=None):
-                 logger.info(f"Mock ClickHouse Query: {query}, Params: {params}")
-                 # Simulate successful insert
-                 if "INSERT INTO" in query:
-                      logger.info("Mock Insert successful")
-                      return [] # Return empty list for successful insert
-
-             def execute_batch(self, query, params):
-                  logger.info(f"Mock ClickHouse Batch Query: {query}, Params: {params}")
-                  # Simulate successful batch insert
-                  if "INSERT INTO" in query:
-                      logger.info("Mock Batch Insert successful")
-                      return []
-
-             def use(self, database_name):
-                 logger.info(f"Mock ClickHouse: Using database {database_name}")
-                 # Simulate switching database context
-                 self.current_database = database_name
-
-             def close(self): pass
-
-        ch_client = MockClickHouseClient()
-
-
     except Exception as e:
-        logger.error(f"Failed to connect to ClickHouse: {e}")
-        # ClickHouse is critical for storing data
+        logger.critical(f"Failed to connect to ClickHouse: {e}", exc_info=True)
         raise
 
 
-def validate_client(client_id, api_key_hash):
+def validate_client(client_id: str, api_key_hash: str) -> dict | None:
+    # ... (This function does NOT use the ClickHouse client directly, so no changes needed here) ...
     """
     Validates client using Redis cache, falls back to PostgreSQL.
-    Returns client metadata (db_name, status) or None if invalid/inactive.
+    Returns client metadata (client_id, api_key_hash, ch_database_name, status)
+    or None if invalid/inactive or error.
     """
     cache_key = f"client:{client_id}"
-    # logger.debug(f"Checking cache for client_id: {client_id}") # Enable for debugging cache
+    client_info = None
 
-    # 1. Check Redis Cache (Placeholder uses MockRedis)
-    # cached_data = redis_client.get(cache_key)
-    # if cached_data:
-    #     try:
-    #         client_info = json.loads(cached_data)
-    #         logger.debug(f"Cache hit for client_id: {client_id}")
-    #         # Check if status is active from cache
-    #         if client_info.get("status") == "active":
-    #             # Also re-validate API key hash from cache for security
-    #             if client_info.get("api_key_hash") == api_key_hash:
-    #                  return client_info # Cache hit and valid
-    #             else:
-    #                  logger.warning(f"API key hash mismatch for client_id: {client_id} (Cache hit but invalid hash)")
-    #                  # Invalidate cache entry on hash mismatch
-    #                  # redis_client.delete(cache_key)
-    #                  # Fallback to PG
-    #         else:
-    #              logger.debug(f"Cache hit but client not active for client_id: {client_id} (Status: {client_info.get('status')})")
-    #              # Don't cache inactive clients? Or refresh cache?
-    #              return None # Not active
-    #     except json.JSONDecodeError:
-    #         logger.error(f"Failed to decode cached data for client_id: {client_id}. Invalidating cache.")
-    #         # redis_client.delete(cache_key)
-    #     except Exception as e:
-    #          logger.error(f"Error processing cached data for client_id: {client_id}: {e}")
-    #          # redis_client.delete(cache_key)
+    if redis_client:
+        try:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                try:
+                    client_info = json.loads(cached_data)
+                    logger.debug(f"Cache hit for client_id: {client_id}")
+                    if client_info.get("api_key_hash") == api_key_hash and client_info.get("status") == "active":
+                         logger.debug(f"Client valid from cache: {client_id}")
+                         return client_info
+                    else:
+                         logger.warning(f"Cache hit but client invalid/inactive for client_id: {client_id}. Invalidate cache entry.")
+                         try:
+                             redis_client.delete(cache_key)
+                         except Exception as e_del:
+                             logger.error(f"Failed to delete cache key {cache_key}: {e_del}", exc_info=True)
 
-    # logger.debug(f"Cache miss or invalid for client_id: {client_id}. Falling back to DB.")
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"Failed to decode/process cached data for client_id: {client_id}: {e}. Invalidating cache.", exc_info=True)
+                    try:
+                        redis_client.delete(cache_key)
+                    except Exception as e_del:
+                        logger.error(f"Failed to delete cache key {cache_key} after decode error: {e_del}", exc_info=True)
+                except Exception as e:
+                     logger.error(f"Unexpected error processing cached data for client_id: {client_id}: {e}", exc_info=True)
+                     try:
+                        redis_client.delete(cache_key)
+                     except Exception as e_del:
+                        logger.error(f"Failed to delete cache key {cache_key} after unexpected error: {e_del}", exc_info=True)
 
-    # 2. Fallback to PostgreSQL (Placeholder uses MockPgPool)
+        except Exception as e:
+            logger.error(f"Redis error while checking cache for {client_id}: {e}", exc_info=True)
+
+    logger.debug(f"Cache miss or invalid for client_id: {client_id}. Falling back to DB.")
+
     conn = None
     cursor = None
-    try:
-        conn = pg_conn_pool.getconn()
-        cursor = conn.cursor()
-        # **IMPORTANT**: Never put api_key_hash directly in the query string. Use parameters!
-        query = "SELECT client_id, api_key_hash, ch_database_name, status FROM clients WHERE client_id = %s AND api_key_hash = %s AND status = 'active';"
-        cursor.execute(query, (client_id, api_key_hash))
-        client_record = cursor.fetchone()
+    if pg_conn_pool:
+        try:
+            conn = pg_conn_pool.getconn()
+            cursor = conn.cursor()
+            query = "SELECT client_id, api_key_hash, ch_database_name, status FROM clients WHERE client_id = %s AND api_key_hash = %s AND status = 'active';"
+            cursor.execute(query, (client_id, api_key_hash))
+            client_record = cursor.fetchone()
 
-        if client_record:
-            # (client_id, api_key_hash, ch_database_name, status)
-            client_info = {
-                "client_id": str(client_record[0]), # Ensure UUID is string
-                "api_key_hash": client_record[1],
-                "ch_database_name": client_record[2],
-                "status": client_record[3]
-            }
-            logger.info(f"Client validated from DB: {client_id}")
-            # 3. Cache the result (Placeholder uses MockRedis)
-            # try:
-            #     redis_client.setex(cache_key, CLIENT_CACHE_TTL_SECONDS, json.dumps(client_info))
-            #     logger.debug(f"Client info cached for client_id: {client_id}")
-            # except Exception as e:
-            #      logger.error(f"Failed to cache client info for {client_id}: {e}")
-            return client_info
-        else:
-            logger.warning(f"Client not found or not active in DB for client_id: {client_id}")
-            return None # Not found or not active/invalid hash
+            if client_record:
+                client_info = {
+                    "client_id": str(client_record[0]),
+                    "api_key_hash": client_record[1],
+                    "ch_database_name": client_record[2],
+                    "status": client_record[3]
+                }
+                logger.info(f"Client validated from DB: {client_id}")
+                if redis_client:
+                    try:
+                        redis_client.setex(cache_key, CLIENT_CACHE_TTL_SECONDS, json.dumps(client_info))
+                        logger.debug(f"Client info cached for client_id: {client_id}")
+                    except Exception as e:
+                         logger.error(f"Failed to cache client info for {client_id}: {e}", exc_info=True)
+                return client_info
+            else:
+                logger.warning(f"Client not found, not active, or invalid hash in DB for client_id: {client_id}")
+                return None
 
-    except Exception as e:
-        logger.error(f"Database error while validating client {client_id}: {e}")
-        # Depending on error, maybe retry or send to DLQ
+        except Exception as e:
+            logger.error(f"Database error while validating client {client_id}: {e}", exc_info=True)
+            return None
+        finally:
+            if cursor:
+                try: cursor.close()
+                except Exception: pass
+            if conn:
+                try: pg_conn_pool.putconn(conn)
+                except Exception: pass
+
+    else:
+        logger.error(f"PostgreSQL connection pool is not initialized. Cannot validate client {client_id}.")
         return None
-    finally:
-        if cursor: cursor.close()
-        if conn: pg_conn_pool.putconn(conn)
 
 
-def insert_into_clickhouse(client_info, event_data):
+def insert_into_clickhouse(client_info: dict, event_data: dict) -> bool:
     """
-    Inserts event data into the correct client database in ClickHouse.
+    Inserts event data into the correct client database in ClickHouse using clickhouse-connect.
+    Returns True on success, False on failure.
     """
     db_name = client_info["ch_database_name"]
-    # logger.debug(f"Inserting event into ClickHouse DB: {db_name}")
 
-    # Placeholder uses MockClickHouseClient
+    if ch_client is None:
+        logger.error("ClickHouse client is not initialized. Cannot insert event.")
+        return False
+
     try:
-        # In a real client library, you'd switch database context or include it in the query
-        # ch_client.use(db_name)
+        event_id = event_data.get('event_id')
+        if event_id is None:
+             event_id = str(uuid.uuid4())
+             logger.warning(f"Event missing event_id, generating UUID: {event_id}")
 
-        # Prepare data for insertion. Ensure event_properties is a JSON string if ClickHouse expects JSON
-        # Example data structure: [{'event_id': '...', 'event_time': '...', 'event_properties': '{...}'}]
-        # You need to adapt this based on how you want to flatten/process event_data
-        # For now, let's assume event_data is the dictionary payload and we convert event_properties to JSON string
-        data_to_insert = [{
-             'event_id': event_data.get('event_id'), # Assuming event_id is in payload
-             'event_time': event_data.get('event_time'), # Assuming event_time is in payload
-             'event_properties': json.dumps(event_data.get('event_properties', {})) # Assuming properties is a dict
-        }]
-        # logger.debug(f"Data to insert: {data_to_insert}")
+        event_time = event_data.get('event_time')
+        if event_time is None:
+             event_time = int(time.time()) # Use Unix timestamp in seconds
+             logger.warning(f"Event missing event_time, using current timestamp: {event_time}")
 
-        # Example using execute_batch for better performance
-        # query = f"INSERT INTO {db_name}.events_base (event_id, event_time, event_properties) VALUES"
-        # ch_client.execute_batch(query, data_to_insert) # Use execute_batch for multiple rows
+        event_properties_dict = event_data.get('event_properties', {})
 
-        # Placeholder mock execution
-        ch_client.use(db_name)
-        ch_client.execute("INSERT INTO {db_name}.events_base (event_id, event_time, event_properties) VALUES", data_to_insert)
+        # --- CHANGE: Prepare data and use clickhouse-connect client.insert ---
+        # clickhouse-connect.insert expects the table name, a list of data rows,
+        # and optional database name. It handles serialization based on column types.
+        # If event_properties is String, we pass a JSON string.
+        # If event_properties were JSON (and driver/server compatible), we could pass the dict.
 
-        logger.info(f"Successfully inserted event into {db_name}.events_base")
+        # Assuming the ClickHouse column is now String, we need to pass a JSON string
+        data_row = [
+            event_id, # UUID
+            event_time, # DateTime (int seconds)
+            json.dumps(event_properties_dict) # JSON string for String column
+            # Add other top-level fields here
+        ]
+        data_to_insert = [data_row] # insert method expects a list of rows
+
+        table_name = 'events_base'
+
+        # clickhouse-connect.insert method
+        # It automatically determines column types from the server and serializes data
+        ch_client.insert(
+            table=table_name,
+            data=data_to_insert,
+            database=db_name # Specify the target database
+            # column_names=['event_id', 'event_time', 'event_properties'] # Optional but good practice
+        )
+
+        logger.info(f"Successfully inserted 1 event into {db_name}.{table_name}")
         return True
 
     except Exception as e:
-        logger.error(f"Failed to insert event into ClickHouse DB {db_name}: {e}")
+        logger.error(f"Failed to insert event into ClickHouse DB {db_name}: {e}", exc_info=True)
+        # Log specific clickhouse-connect errors if needed
+        # import clickhouse_connect.driver.exceptions as ch_exc
+        # if isinstance(e, ch_exc.ClickHouseError):
+        #      logger.error(f"ClickHouse error details: Code {e.code}, Text: {e.message}")
         return False
+    # --- END CHANGE ---
 
 
-def process_event(kafka_message):
-    """Processes a single event message from Kafka."""
+# ... (rest of process_event, produce_to_dlq, run_router, HealthCheckHandler, etc. - should not need changes) ...
+
+def process_event(kafka_message) -> bool:
+    """
+    Processes a single event message from Kafka.
+    Returns True if message was successfully processed (validated and inserted), False otherwise.
+    """
+    original_payload_bytes = kafka_message.value
+
     try:
-        # Deserialize event data (assuming JSON)
-        # message.value is bytes
-        event_data = json.loads(kafka_message.value)
+        event_data = json.loads(original_payload_bytes.decode('utf-8'))
         logger.info(f"Received event: {event_data}")
 
-        # Extract client identification (assuming it's in the event payload)
         client_id = event_data.get('client_id')
-        api_key = event_data.get('api_key') # Or raw key to hash, or hash directly
-        # **IMPORTANT**: If receiving raw key, hash it *before* validation!
-        # For this placeholder, let's assume the hash is already in the payload for simplicity
         api_key_hash = event_data.get('api_key_hash')
-
 
         if not client_id or not api_key_hash:
             logger.warning(f"Event missing client_id or api_key_hash. Sending to DLQ. Event: {event_data}")
-            produce_to_dlq(kafka_message.value, "missing_client_id_or_hash")
-            return False # Indicate processing failure
+            produce_to_dlq(original_payload_bytes, "missing_client_id_or_hash")
+            return False
 
-        # Validate the client
         client_info = validate_client(client_id, api_key_hash)
 
         if client_info and client_info.get('status') == 'active':
-            # Client is valid and active, proceed with insertion
             success = insert_into_clickhouse(client_info, event_data)
             if not success:
-                 # If insertion failed, send to DLQ
-                 produce_to_dlq(kafka_message.value, "clickhouse_insert_failed")
-            return success # Indicate processing success or failure
+                produce_to_dlq(original_payload_bytes, "clickhouse_insert_failed")
+            return success
         else:
-            # Client validation failed (not found, invalid hash, or inactive)
             logger.warning(f"Client validation failed for client_id: {client_id}. Sending to DLQ. Event: {event_data}")
-            produce_to_dlq(kafka_message.value, "client_validation_failed")
-            return False # Indicate processing failure
+            produce_to_dlq(original_payload_bytes, "client_validation_failed")
+            return False
 
     except json.JSONDecodeError:
-        logger.error(f"Failed to decode JSON from Kafka message: {kafka_message.value}. Sending to DLQ.")
-        produce_to_dlq(kafka_message.value, "json_decode_error")
+        logger.error(f"Failed to decode JSON from Kafka message: {original_payload_bytes}. Sending to DLQ.", exc_info=True)
+        produce_to_dlq(original_payload_bytes, "json_decode_error")
         return False
     except Exception as e:
-        logger.error(f"An unexpected error occurred processing message {kafka_message.offset}: {e}. Sending to DLQ.")
-        produce_to_dlq(kafka_message.value, f"unexpected_error: {type(e).__name__}")
+        logger.error(f"An unexpected error occurred processing message {kafka_message.offset}: {e}. Sending to DLQ.", exc_info=True)
+        produce_to_dlq(original_payload_bytes, f"unexpected_error: {type(e).__name__}")
         return False
 
-def produce_to_dlq(original_payload, reason):
+def produce_to_dlq(original_payload: bytes, reason: str):
     """Produces a message to the Dead Letter Queue topic."""
+    if kafka_producer is None:
+        logger.critical("Kafka producer is not initialized, cannot send to DLQ!")
+        logger.error(f"Original message lost: {original_payload.decode('utf-8', errors='ignore')}")
+        return
+
     try:
         dlq_message = {
-            "original_payload": json.loads(original_payload.decode('utf-8')), # Decode bytes to string before loading JSON
+            "original_payload_raw": original_payload.decode('utf-8', errors='ignore'),
             "reason": reason,
-            "timestamp": time.time()
+            "timestamp_utc": int(time.time())
         }
-        # producer expects bytes, our serializer makes it bytes
-        kafka_producer.send(KAFKA_TOPIC_DLQ, value=dlq_message)
+        future = kafka_producer.send(KAFKA_TOPIC_DLQ, value=dlq_message)
+        future.get(timeout=10)
         logger.info(f"Sent message to DLQ ({KAFKA_TOPIC_DLQ}) due to: {reason}")
     except Exception as e:
-        logger.error(f"Failed to send message to DLQ: {e}")
-        # At this point, the message is likely lost unless you have other mechanisms
-        # Consider logging the message content to a file as a last resort
-        logger.error(f"Original message that failed to go to DLQ: {original_payload}")
-
+        logger.error(f"Failed to send message to DLQ: {e}", exc_info=True)
+        logger.critical(f"Message failed to go to DLQ and is potentially lost. Reason: {reason}. Original payload: {original_payload.decode('utf-8', errors='ignore')}")
 
 def run_router():
     """Main function to connect to services and start consuming Kafka messages."""
@@ -384,63 +370,119 @@ def run_router():
 
     logger.info(f"Listening for messages on Kafka topic: {KAFKA_TOPIC_RAW}")
 
-    # Process messages in batches for efficiency (adjust batch size as needed)
-    # The kafka-python consumer provides messages in batches when iterating
-    for message in kafka_consumer:
-        logger.info(f"Processing message from topic {message.topic}, partition {message.partition}, offset {message.offset}")
-        # In a real batch processing loop, you'd process a batch of messages
-        # and then commit offsets for the entire batch.
-        # For simplicity in this placeholder, we process one by one and commit per message
-        # (less efficient but easier to demonstrate).
+    try:
+        for message in kafka_consumer:
+            logger.info(f"Processing message from topic {message.topic}, partition {message.partition}, offset {message.offset}")
 
-        processed_successfully = process_event(message)
+            processed_successfully = process_event(message)
 
-        if processed_successfully:
-             logger.info(f"Message {message.offset} processed successfully.")
-             # Manually commit offset after successful processing
-             kafka_consumer.commit()
-             logger.debug(f"Committed offset {message.offset} for partition {message.partition}")
+            if processed_successfully:
+                 logger.info(f"Message {message.offset} processed successfully.")
+                 try:
+                     kafka_consumer.commit()
+                     logger.debug(f"Committed offset {message.offset} for partition {message.partition}")
+                 except Exception as e:
+                     logger.error(f"Failed to commit offset {message.offset}: {e}", exc_info=True)
+
+            else:
+                 logger.warning(f"Message {message.offset} failed processing. Sent to DLQ.")
+                 pass
+
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received (KeyboardInterrupt). Shutting down router.")
+        pass
+    except Exception as e:
+         logger.critical(f"Kafka consumption loop failed unexpectedly: {e}", exc_info=True)
+         raise
+
+    finally:
+        logger.info("Router consumption loop finished. Cleaning up connections.")
+        if kafka_consumer:
+            try:
+                kafka_consumer.commit_sync()
+                kafka_consumer.close()
+                logger.info("Kafka consumer closed.")
+            except Exception as e:
+                logger.error(f"Error closing Kafka consumer: {e}")
+        if kafka_producer:
+            try:
+                kafka_producer.flush()
+                kafka_producer.close()
+                logger.info("Kafka producer closed.")
+            except Exception as e:
+                logger.error(f"Error closing Kafka producer: {e}")
+        if redis_client:
+            try:
+                redis_client.close()
+                logger.info("Redis client closed.")
+            except Exception as e:
+                logger.error(f"Error closing Redis client: {e}")
+        if pg_conn_pool:
+            try:
+                pg_conn_pool.closeall()
+                logger.info("PostgreSQL connection pool closed.")
+            except Exception as e:
+                logger.error(f"Error closing PG pool: {e}")
+        if ch_client:
+            try:
+                 # clickhouse-connect client has a close method
+                 ch_client.close()
+                 logger.info("ClickHouse client closed.")
+            except Exception as e:
+                logger.error(f"Error closing ClickHouse client: {e}")
+
+# --- Health Check Server ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/healthz':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
         else:
-             logger.warning(f"Message {message.offset} failed processing. Sent to DLQ.")
-             # Do NOT commit offset if processing failed and sent to DLQ.
-             # The message will be re-delivered on consumer restart/rebalance.
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+health_check_server: HTTPServer | None = None
+
+def start_health_check_server():
+    global health_check_server
+    try:
+        server_address = ('0.0.0.0', ROUTER_LISTEN_PORT)
+        health_check_server = HTTPServer(server_address, HealthCheckHandler)
+        logger.info(f"Health check server listening on port {ROUTER_LISTEN_PORT}")
+        health_check_server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start health check server: {e}", exc_info=True)
+
+
+def stop_health_check_server():
+    global health_check_server
+    if health_check_server:
+        logger.info("Shutting down health check server.")
+        try:
+            health_check_server.shutdown()
+            health_check_server.server_close()
+        except Exception as e:
+            logger.error(f"Error shutting down health check server: {e}")
 
 
 if __name__ == "__main__":
-    # Implement a basic HTTP server for health check if needed
-    # from http.server import BaseHTTPRequestHandler, HTTPServer
-    # class HealthCheckHandler(BaseHTTPRequestHandler):
-    #     def do_GET(self):
-    #         if self.path == '/healthz':
-    #             self.send_response(200)
-    #             self.end_headers()
-    #             self.wfile.write(b'OK')
-    #         else:
-    #             self.send_response(404)
-    #             self.end_headers()
-    # server = HTTPServer(('0.0.0.0', ROUTER_LISTEN_PORT), HealthCheckHandler)
-    # # Run the health check server in a separate thread or process
-    # import threading
-    # health_thread = threading.Thread(target=server.serve_forever)
-    # health_thread.daemon = True # Allow main thread to exit even if health thread is running
-    # health_thread.start()
-    # logger.info(f"Health check server listening on port {ROUTER_LISTEN_PORT}")
+    health_thread = threading.Thread(target=start_health_check_server)
+    health_thread.daemon = True
+    health_thread.start()
+    logger.info("Health check thread started.")
 
-
-    # Run the main router logic
     try:
         run_router()
-    except KeyboardInterrupt:
-        logger.info("Shutting down router.")
-        if kafka_consumer:
-            kafka_consumer.close()
-        if kafka_producer:
-             kafka_producer.close()
-        # Close other connections if they were real
-        # if redis_client: redis_client.close()
-        # if pg_conn_pool: pg_conn_pool.closeall()
-        # if ch_client: ch_client.close()
     except Exception as e:
-        logger.critical(f"Router crashed due to an unhandled error: {e}", exc_info=True)
-        # Log the error and exit. Container orchestrator will restart.
-        os._exit(1) # Exit with non-zero status
+        logger.critical(f"Router initialization or main loop failed: {e}", exc_info=True)
+        os._exit(1)
+
+    finally:
+        logger.info("Main router process finished.")
+        stop_health_check_server()
+        logger.info("Router process exiting.")
