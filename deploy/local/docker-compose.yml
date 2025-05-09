@@ -196,8 +196,6 @@ services:
       - ../../airflow/requirements.txt:/requirements.txt
       # Mount your DAGs into the webserver so it can find them
       - ../../airflow/dags:/opt/airflow/dags
-      # Mount DLT sources if you have custom ones
-      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
       # Mount logs volume so logs are persistent and accessible
       - airflow_logs:/opt/airflow/logs
       # Mount custom plugins if any
@@ -254,7 +252,6 @@ services:
       - ../../airflow/requirements.txt:/requirements.txt
       # Mount the same DAGs, DLT sources, and logs as the webserver
       - ../../airflow/dags:/opt/airflow/dags
-      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
       - airflow_logs:/opt/airflow/logs
       # - ./airflow/plugins:/opt/airflow/plugins # Mount custom plugins
 
@@ -312,7 +309,7 @@ services:
       - ../../airflow/requirements.txt:/requirements.txt
       # Mount the same DAGs, DLT sources, and logs as the webserver/scheduler
       - ../../airflow/dags:/opt/airflow/dags
-      - ../../airflow/dlt_sources:/opt/airflow/dlt_sources
+      - ../../clickhouse/migrations:/opt/airflow/dags/clickhouse/migrations/
       - airflow_logs:/opt/airflow/logs
       # - ./airflow/plugins:/opt/airflow/plugins # Mount custom plugins
 

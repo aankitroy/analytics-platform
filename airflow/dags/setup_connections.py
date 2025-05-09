@@ -5,6 +5,7 @@ from airflow.models import Connection
 from airflow.utils.session import provide_session
 import os
 import sqlalchemy
+import json
 
 default_args = {
     'owner': 'airflow',
@@ -31,15 +32,29 @@ def create_connections(**context):
             port=int(os.environ.get('POSTGRES_METADATA_PORT', 5432))
         )
         
-        # ClickHouse connection
+        # ClickHouse connection - use HTTP type for compatibility with clickhouse-connect
+        ch_host = os.environ.get('CLICKHOUSE_HOST')
+        ch_port = int(os.environ.get('CLICKHOUSE_PORT_HTTP', 8123))  # Using HTTP port 8123 instead of native port 9000
+        ch_user = os.environ.get('CLICKHOUSE_USER')
+        ch_password = os.environ.get('CLICKHOUSE_PASSWORD')
+        
+        # Create extra JSON with detailed connection parameters
+        extra_dict = {
+            "verify": False,
+            "database": "default",
+            "connect_timeout": 10,
+            "send_receive_timeout": 300,
+            "client_name": "airflow_clickhouse"
+        }
+        
         ch_conn = Connection(
             conn_id='clickhouse_external_conn',
-            conn_type='http', # Airflow doesn't have native ClickHouse type
-            host=os.environ.get('CLICKHOUSE_HOST'),
-            port=int(os.environ.get('CLICKHOUSE_PORT_NATIVE', 9000)),  # Use native protocol port
-            login=os.environ.get('CLICKHOUSE_USER'),
-            password=os.environ.get('CLICKHOUSE_PASSWORD'),
-            extra='{"protocol": "native"}' # Use native protocol for clickhouse-connect
+            conn_type='http',  # Use http as the conn_type for clickhouse-connect
+            host=ch_host,
+            port=ch_port,
+            login=ch_user,
+            password=ch_password,
+            extra=json.dumps(extra_dict)
         )
         
         # Redis connection

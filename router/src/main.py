@@ -216,7 +216,7 @@ def validate_client(client_id: str, api_key_hash: str) -> dict | None:
                         redis_client.setex(cache_key, CLIENT_CACHE_TTL_SECONDS, json.dumps(client_info))
                         logger.debug(f"Client info cached for client_id: {client_id}")
                     except Exception as e:
-                         logger.error(f"Failed to cache client info for {client_id}: {e}", exc_info=True)
+                        logger.error(f"Failed to cache client info for {client_id}: {e}", exc_info=True)
                 return client_info
             else:
                 logger.warning(f"Client not found, not active, or invalid hash in DB for client_id: {client_id}")
