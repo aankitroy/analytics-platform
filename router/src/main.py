@@ -166,8 +166,8 @@ def validate_client(client_id: str, api_key_hash: str) -> dict | None:
                     client_info = json.loads(cached_data)
                     logger.debug(f"Cache hit for client_id: {client_id}")
                     if client_info.get("api_key_hash") == api_key_hash and client_info.get("status") == "active":
-                         logger.debug(f"Client valid from cache: {client_id}")
-                         return client_info
+                        logger.debug(f"Client valid from cache: {client_id}")
+                        return client_info
                     else:
                          logger.warning(f"Cache hit but client invalid/inactive for client_id: {client_id}. Invalidate cache entry.")
                          try:
